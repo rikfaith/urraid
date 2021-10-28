@@ -291,6 +291,7 @@ class Raid():
     def _get_status(self):
         self._clear_status()
         self._get_partitions()
+        DEBUG('determining device status')
         for partition in self.partitions:
             if partition.startswith('major') or partition == '':
                 continue
@@ -315,18 +316,20 @@ class Raid():
                     self.level[uuid] = level
 
             # For all of the md devices, determine the UUID of the md.
+            uuid = None
             result, _ = self.ssh.execute(f'mdadm -Q --detail {dev}')
             for line in result:
                 if re.search(r'UUID : ', line):
                     uuid = re.sub('.* UUID : ', '', line).strip()
                     self.uuid_md[uuid] = name
                     self.mds.add(name)
-                if re.search(r'Failed Devices :', line):
+                if uuid and re.search(r'Failed Devices :', line):
                     failed = re.sub('.* Devices : ', '', line).strip()
                     self.failed[uuid] = int(failed)
 
         # Determine encryption status. If the header is detached, we can make
         # a determination from the uuid without the md device.
+        DEBUG('determining encryption status')
         for uuid in self.uuid_devs:
             name = self.uuid_md.get(uuid)
             if name is not None:
@@ -341,6 +344,7 @@ class Raid():
                         self.encrypted.add(uuid)
 
         # Determine volume mapping
+        DEBUG('determining volume mapping')
         result, _ = self.ssh.execute('dmsetup deps -o devname')
         for line in result:
             if re.search(r'No devices', line):
@@ -358,6 +362,7 @@ class Raid():
                 self.provides[dep] = volume
 
         # Determine sizes
+        DEBUG('determinging volume sizes')
         for volume in self.mapping:
             result, _ = self.ssh.execute(
                 f'pvs --rows --units b /dev/mapper/{volume}')
@@ -384,6 +389,7 @@ class Raid():
                         self.lvs.add(volume)
 
         # Determine what is mounted
+        DEBUG('determining mount status')
         result, _ = self.ssh.execute(
             'df -B1 --output=source,target,fstype,size,used')
         for line in result:
@@ -515,7 +521,7 @@ class Raid():
                     secret = ursecret.UrSecret(key_remote[0],
                                                socket.gethostname(),
                                                debug=args.debug)
-                    partial = secrets.token_hex(32)
+                    partial = secrets.token_hex(64)
                     secret.locate_key()
                     secret.put_secret(uuid, partial)
             luks_key = self._get_luks_key(uuid)
@@ -566,8 +572,8 @@ class Raid():
             result, _ = self.ssh.execute(
                 f'cryptsetup luksOpen /dev/{name} '
                 f'--header "{uuid}.header" {volume}',
-                prompt='passphrase', data=luks_key, ending=':')
-            self._dump(result)
+                prompt='passphrase', data=luks_key, ending=':',
+                output=self.INFO)
             self.INFO(f'finished decrypting {name} {uuid} as {volume}')
 
     def _luksclose(self):
@@ -605,7 +611,7 @@ class Raid():
             # Do fsck
             self.INFO(f'checking {path}')
             self.ssh.execute(f'e2fsck -f -y {path}', output=self.INFO,
-                             timeout=60)
+                             timeout=600)
             self.INFO(f'checked: {path}')
 
             # Mount
@@ -614,6 +620,7 @@ class Raid():
             if not os.path.exists(mountpoint):
                 result, _ = self.ssh.execute(f'mkdir {mountpoint}')
                 self._dump(result)
+            DEBUG('mounting {path} on {mountpoint}')
             result, _ = self.ssh.execute(
                 f'mount -onoatime,nodiratime {path} {mountpoint}')
             self._dump(result)
@@ -629,7 +636,7 @@ class Raid():
             self.INFO(f'finished umounting {mountpoint}')
 
     def _services(self, start=False):
-        for service in [ 'nfs-kernel-server', 'rsync' ]:
+        for service in [ 'rpcbind', 'nfs-kernel-server', 'rsync' ]:
             if start:
                 result, _ = self.ssh.execute(f'/etc/init.d/{service} start',
                                              output=self.INFO, timeout=60)
@@ -638,19 +645,32 @@ class Raid():
             self._dump(result)
 
     def up(self):
+        DEBUG('bringing services down')
         self._services(start=False)
+        DEBUG('bringing md devices up')
         self._md5up()
+        DEBUG('opening LUKS devices')
         self._luksopen()
+        DEBUG('changing LV status')
         self._lvchange(on=True)
+        DEBUG('mounting')
         self._mount()
+        DEBUG('bringing services up')
         self._services(start=True)
+        DEBUG('up complete')
         self.status()
 
     def down(self):
+        DEBUG('bringing services down')
         self._services(start=False)
+        DEBUG('unmounting')
         self._umount()
+        DEBUG('changing LV status')
         self._lvchange(on=False)
+        DEBUG('closing LUKS devices')
         self._luksclose()
+        DEBUG('down complete')
+        self.status()
 
     def create(self):
         self._services(start=False)

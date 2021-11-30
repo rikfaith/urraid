@@ -9,7 +9,6 @@ import multiprocessing
 import inspect
 import logging
 import os
-import paramiko
 import queue
 import re
 import secrets
@@ -18,6 +17,15 @@ import socket
 import sys
 import time
 import traceback
+
+# Imports that might have to be installed
+try:
+    import paramiko
+except ImportError as e:
+    print('''\
+# Cannot load paramiko: {}
+# Consider: apt-get install python3-paramiko'''.format(e))
+    raise SystemExit from e
 
 sys.path.insert(1, os.path.join(sys.path[0], '../ursecret'))
 try:
@@ -100,7 +108,9 @@ class Ssh():
         self.timeout = timeout
 
         self.client = None
-        self._connect(self.user)
+        result = self._connect(self.user)
+        if result is not None:
+            FATAL(result)
 
     def _connect(self, user):
         self.client = paramiko.client.SSHClient()
@@ -116,7 +126,6 @@ class Ssh():
             return prefix + 'Invalid username, or password required'
         except Exception as exception:
             return prefix + str(exception)
-
         return None
 
     @staticmethod
@@ -130,7 +139,8 @@ class Ssh():
                 if timeout and time.time() - start > timeout:
                     break
                 if ending and buffer.endswith(ending):
-                    break
+                    yield buffer
+                    buffer = ''
                 continue
             start = time.time() # Restart timeout because we have data
             if len(rlist) > 0:
@@ -144,13 +154,14 @@ class Ssh():
                 except ValueError:
                     yield re.sub(r'[\n\r]*', '', buffer)
                     buffer = ''
+                    print('ValueError')
                     break
                 yield line
         try:
             buffer += channel.recv_stderr(4096).decode('utf-8')
         except socket.timeout:
             time.sleep(.1)
-        if len(buffer) > 0:
+        if buffer != '':
             yield buffer
 
     def execute(self, command, ending=None, prompt=None, data=None,
@@ -159,20 +170,26 @@ class Ssh():
             timeout = self.timeout
         result = []
         try:
-            channel = self.client.get_transport().open_session()
+            transport = self.client.get_transport()
+            if transport is None:
+                FATAL('Cannot get_transport()')
+            channel = transport.open_session()
         except Exception as exception:
-            FATAL(f'Cannot open session to {self.user}@{self.remote}')
+            FATAL(f'Cannot open session to {self.user}@{self.remote}: '
+                  '{}'.format(repr(exception)))
         # Get a pty so that stderr will be combined with stdout. Otherwise, we
         # only get stderr if there is any output on stderr.
         channel.get_pty()
         channel.exec_command(command)
-        for line in self._linesplit(channel, timeout=timeout, ending=ending):
-            if output is not None:
-                output(line)
-            if prompt is not None and re.search(prompt, line):
-                channel.send(data + '\n')
-                continue
-            result.append(line)
+        while not channel.exit_status_ready():
+            for line in self._linesplit(channel, timeout=timeout,
+                                        ending=ending):
+                if output is not None:
+                    output(line)
+                if prompt is not None and re.search(prompt, line):
+                    channel.send(data + '\n')
+                    continue
+                result.append(line)
         exit_status = channel.recv_exit_status()
         return result, exit_status
 
@@ -569,12 +586,15 @@ class Raid():
             if luks_key == '':
                 self.INFO(f'cannot determine LUKS key for {uuid}')
                 continue
-            result, _ = self.ssh.execute(
+            result, exit_status = self.ssh.execute(
                 f'cryptsetup luksOpen /dev/{name} '
                 f'--header "{uuid}.header" {volume}',
                 prompt='passphrase', data=luks_key, ending=':',
-                output=self.INFO)
-            self.INFO(f'finished decrypting {name} {uuid} as {volume}')
+                output=self.INFO, timeout=20)
+            if exit_status == 0:
+                self.INFO(f'finished decrypting {name} {uuid} as {volume}')
+            else:
+                self.FATAL(f'could not decrypt {name}: {exit_status}')
 
     def _luksclose(self):
         self._get_status()
@@ -815,7 +835,8 @@ if __name__ == '__main__':
 
     INFO(f'target_list={target_list}')
 
-    if args.command == 'CREATE' and not args.lvsvolume or len(target_list) > 1:
+    if args.command == 'CREATE' and (not args.lvsvolume or
+                                     len(target_list) > 1):
         parser.print_help()
         sys.exit(1)
 

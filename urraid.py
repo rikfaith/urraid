@@ -3,6 +3,7 @@
 # Copyright 2021 by Rik Faith (rikfaith@users.noreply.github.com)
 # This program comes with ABSOLUTELY NO WARRANTY.
 
+import argparse
 import concurrent.futures
 import configparser
 import multiprocessing
@@ -17,24 +18,26 @@ import socket
 import sys
 import time
 import traceback
+import typing
 
 # Imports that might have to be installed
 try:
     import paramiko
 except ImportError as e:
-    print('''\
-# Cannot load paramiko: {}
-# Consider: apt-get install python3-paramiko'''.format(e))
+    print(f'''\
+# Cannot load paramiko: {e}
+# Consider: apt-get install python3-paramiko''')
     raise SystemExit from e
 
 sys.path.insert(1, os.path.join(sys.path[0], '../ursecret'))
 try:
     import ursecret
 except ImportError as e:
-    print('''\
-# Cannot load ursecret: {}
-# sys.path={}'''.format(e, sys.path))
+    print(f'''\
+# Cannot load ursecret: {e}
+# sys.path={sys.path}''')
     raise SystemExit from e
+
 
 class Log():
     logger = None
@@ -45,6 +48,7 @@ class Log():
             logging.Formatter.__init__(self)
 
         def format(self, record):
+            # pylint: disable=consider-using-f-string
             level = record.levelname[0]
             date = time.localtime(record.created)
             date_msec = (record.created - int(record.created)) * 1000
@@ -72,7 +76,7 @@ class Log():
     def format_message(record):
         # pylint: disable=broad-except
         try:
-            msg = '%s' % (record.msg % record.args)
+            msg = record.msg % record.args
         except Exception as exception:
             msg = repr(record.msg) + \
                 ' EXCEPTION: ' + repr(exception) + \
@@ -87,6 +91,8 @@ class Log():
 
     @staticmethod
     def setLevel(level):
+        # We use setLevel instead of set_level because that's what logger
+        # does. pylint: disable=invalid-name
         old_level = Log.logger.getEffectiveLevel()
         Log.logger.setLevel(level)
         return old_level
@@ -99,6 +105,7 @@ ERROR = logging.error
 FATAL = Log.fatal
 # Instantiate logging class
 Log()
+
 
 class Ssh():
     def __init__(self, remote, user, debug=False, timeout=5):
@@ -113,16 +120,17 @@ class Ssh():
             FATAL(result)
 
     def _connect(self, user):
+        # pylint: disable=broad-except
         self.client = paramiko.client.SSHClient()
         self.client.load_system_host_keys()
         self.client.set_missing_host_key_policy(
             paramiko.client.AutoAddPolicy())
 
-        prefix = 'Cannot ssh to {}@{}: '.format(user, self.remote)
+        prefix = 'Cannot ssh to {user}@{self.remote}: '
         try:
             self.client.connect(self.remote, username=user,
                                 timeout=self.timeout)
-        except paramiko.ssh_exception.PasswordRequiredException as exception:
+        except paramiko.ssh_exception.PasswordRequiredException:
             return prefix + 'Invalid username, or password required'
         except Exception as exception:
             return prefix + str(exception)
@@ -142,7 +150,7 @@ class Ssh():
                     yield buffer
                     buffer = ''
                 continue
-            start = time.time() # Restart timeout because we have data
+            start = time.time()  # Restart timeout because we have data
             if len(rlist) > 0:
                 try:
                     buffer += channel.recv(4096).decode('utf-8')
@@ -166,6 +174,7 @@ class Ssh():
 
     def execute(self, command, ending=None, prompt=None, data=None,
                 output=None, timeout=None):
+        # pylint: disable=broad-except
         if timeout is None:
             timeout = self.timeout
         result = []
@@ -197,16 +206,16 @@ class Ssh():
 class Config():
     def __init__(self, paths=None):
         if paths is None:
-            self.paths = [ '~/.urraid',
-                           '~/.config/urraid/config',
-                           '/etc/urraid' ]
+            self.paths = ['~/.urraid',
+                          '~/.config/urraid/config',
+                          '/etc/urraid']
         else:
             if isinstance(paths, list):
                 self.paths = paths
             else:
                 self.paths = [paths]
         self.configs = []
-        self._parse_configs();
+        self._parse_configs()
 
     def _parse_configs(self):
         DEBUG('self.paths={self.paths}')
@@ -252,8 +261,8 @@ class Config():
         return output
 
 
-
 class Raid():
+    # pylint: disable=invalid-name
     def __init__(self, name, remote, config, command, lvsvolume,
                  mqueue, debug=False, timeout=5):
         self.name = name
@@ -271,15 +280,16 @@ class Raid():
         elif isinstance(self.user, list):
             self.user = self.user[0]
 
+        self.partitions = None  # for pylint
         self._clear_status()
         self.ssh = Ssh(self.remote, self.user, debug=self.debug,
                        timeout=self.timeout)
 
     def INFO(self, message):
-        self.mqueue.put((self.name, message));
+        self.mqueue.put((self.name, message))
 
-    def FATAL(self, message):
-        self.mqueue.put((self.name, message));
+    def FATAL(self, message) -> typing.NoReturn:
+        self.mqueue.put((self.name, message))
         sys.exit(1)
 
     def _dump(self, result):
@@ -291,19 +301,19 @@ class Raid():
             self.partitions, _ = self.ssh.execute('cat /proc/partitions')
 
     def _clear_status(self):
-        self.uuid_devs = dict()
-        self.uuid_md = dict()
+        self.uuid_devs = {}
+        self.uuid_md = {}
         self.mds = set()
         self.encrypted = set()
         self.partitions = None
-        self.mapping = dict()
-        self.sizes = dict()
-        self.level = dict()
-        self.provides = dict()
+        self.mapping = {}
+        self.sizes = {}
+        self.level = {}
+        self.provides = {}
         self.lvs = set()
         self.pvs = set()
-        self.mounts = dict()
-        self.failed = dict()
+        self.mounts = {}
+        self.failed = {}
 
     def _get_status(self):
         self._clear_status()
@@ -312,7 +322,7 @@ class Raid():
         for partition in self.partitions:
             if partition.startswith('major') or partition == '':
                 continue
-            major, minor, blocks, name = partition.split()
+            _, _, _, name = partition.split()
             dev = os.path.join("/dev/", name)
 
             # For the non-md devices, determine the UUID of the md of the
@@ -421,21 +431,21 @@ class Raid():
             name = f'md{i}'
             if name not in self.mds:
                 return name
-        self.FATAL(f'More than 10 md devices not supported')
+        self.FATAL('More than 10 md devices not supported')
 
     def _get_next_volname(self):
         for i in range(0, 10):
             name = f'r{i}'
             if name not in self.mapping:
                 return name
-        self.FATAL(f'More than 10 volumes not supported')
+        self.FATAL('More than 10 volumes not supported')
 
     @staticmethod
     def _human(size):
         if size == '':
             return ''
         size = int(size)
-        units = [ 'b', 'KiB', 'MiB', 'GiB', 'TiB' ]
+        units = ['b', 'KiB', 'MiB', 'GiB', 'TiB']
         unit = 0
         while size > 1024 and unit < len(units) - 1:
             size /= 1024
@@ -445,9 +455,9 @@ class Raid():
     def status(self):
         self._get_status()
         # Report md devices
-        for uuid in self.uuid_devs:
+        for uuid, devs in self.uuid_devs.items():
+            devs = ' '.join(sorted(devs))
             md = self.uuid_md.get(uuid, '')
-            devs = ' '.join(sorted(self.uuid_devs[uuid]))
             size, _ = self.sizes.get(uuid, ('', ''))
             size = self._human(size)
             level = self.level.get(uuid, '')
@@ -459,14 +469,13 @@ class Raid():
                 self.INFO(f'{uuid:41s} {failed} device(s) FAILED **********')
 
         # Report volume mappings
-        for volume in self.mapping:
-            deps = ' '.join(sorted(self.mapping[volume]))
+        for volume, deps in self.mapping.items():
+            deps = ' '.join(sorted(deps))
             size, _ = self.sizes.get(volume, ('', ''))
             size = self._human(size)
             self.INFO(f'{volume:41s} {size:17s} {deps}')
         # Report mounts
-        for volume in self.mounts:
-            mountpoint, fstype = self.mounts[volume]
+        for volume, (mountpoint, fstype) in self.mounts.items():
             size, used = self.sizes.get(mountpoint, ('', ''))
             free = self._human(int(size) - int(used))
             size = self._human(size)
@@ -474,6 +483,7 @@ class Raid():
                 f'{mountpoint:30s} {free:10s} {size:10s} {fstype:6s} {volume}')
 
     def _get_luks_key(self, uuid):
+        # pylint: disable=broad-except
         luks_key = ''
         for key in ['key0', 'key1', 'key2', 'key3']:
             key_remote = self.config.get_value(self.remote, key)
@@ -481,10 +491,10 @@ class Raid():
                 try:
                     secret = ursecret.UrSecret(key_remote[0],
                                                socket.gethostname(),
-                                               debug=args.debug)
+                                               debug=self.debug)
                     secret.locate_key()
                     luks_key += secret.get_secret(uuid)
-                except:
+                except Exception:
                     pass
         return luks_key
 
@@ -513,7 +523,7 @@ class Raid():
             self._dump(result)
 
     def _create_luks_header(self, uuid):
-        remote, status = self.ssh.execute(f'test -f {uuid}.header')
+        _, status = self.ssh.execute(f'test -f {uuid}.header')
         if not status:
             self.FATAL(f'{uuid}.header already exists on {self.remote}')
             return
@@ -537,13 +547,13 @@ class Raid():
                 if key_remote is not None and len(key_remote) > 0:
                     secret = ursecret.UrSecret(key_remote[0],
                                                socket.gethostname(),
-                                               debug=args.debug)
+                                               debug=self.debug)
                     partial = secrets.token_hex(64)
                     secret.locate_key()
                     secret.put_secret(uuid, partial)
             luks_key = self._get_luks_key(uuid)
             if luks_key == '':
-                self.FATAL(f'unable to store LUKS key, check ~/.urraid')
+                self.FATAL('unable to store LUKS key, check ~/.urraid')
 
             result, _ = self.ssh.execute(
                 f'cryptsetup luksFormat /dev/{name} '
@@ -586,7 +596,7 @@ class Raid():
             if luks_key == '':
                 self.INFO(f'cannot determine LUKS key for {uuid}')
                 continue
-            result, exit_status = self.ssh.execute(
+            _, exit_status = self.ssh.execute(
                 f'cryptsetup luksOpen /dev/{name} '
                 f'--header "{uuid}.header" {volume}',
                 prompt='passphrase', data=luks_key, ending=':',
@@ -609,7 +619,7 @@ class Raid():
         self._get_status()
         for lvs in self.lvs:
             path = os.path.join('/dev/mapper', lvs)
-            if on == True:
+            if on:
                 self.INFO(f'activating {path}')
                 result, _ = self.ssh.execute(f'lvchange -ay {path}')
                 self.INFO(f'finished activating {path}')
@@ -635,7 +645,7 @@ class Raid():
             self.INFO(f'checked: {path}')
 
             # Mount
-            vg, lv = lvs.split('-', 1)
+            _, lv = lvs.split('-', 1)
             mountpoint = f'/{lv}'
             if not os.path.exists(mountpoint):
                 result, _ = self.ssh.execute(f'mkdir {mountpoint}')
@@ -648,15 +658,14 @@ class Raid():
 
     def _umount(self):
         self._get_status()
-        for volume in self.mounts:
-            mountpoint, _ = self.mounts[volume]
+        for _, (mountpoint, _) in self.mounts.items():
             self.INFO(f'umounting {mountpoint}')
             result, _ = self.ssh.execute(f'umount {mountpoint}')
             self._dump(result)
             self.INFO(f'finished umounting {mountpoint}')
 
     def _services(self, start=False):
-        for service in [ 'rpcbind', 'nfs-kernel-server', 'rsync' ]:
+        for service in ['rpcbind', 'nfs-kernel-server', 'rsync']:
             if start:
                 result, _ = self.ssh.execute(f'/etc/init.d/{service} start',
                                              output=self.INFO, timeout=60)
@@ -735,7 +744,8 @@ class Pool():
             raid.run()
         except Exception as exception:
             raise Exception(
-                ''.join(traceback.format_exception(*sys.exc_info())))
+                ''.join(traceback.format_exception(*sys.exc_info()))) \
+                from exception
 
     @staticmethod
     def _done_callback(name, future):
@@ -749,7 +759,7 @@ class Pool():
             ERROR('%s: future.result=%s', name, str(future.result()))
 
     def run(self):
-        jobs = dict()
+        jobs = {}
         manager = multiprocessing.Manager()
         mqueue = manager.Queue()
 
@@ -792,8 +802,7 @@ class Pool():
                 INFO('%s: %s', name, message)
 
 
-if __name__ == '__main__':
-    import argparse
+def main():
     parser = argparse.ArgumentParser(
         description='Configure, start, and stop remote data stores')
     parser.add_argument('target', type=str, nargs='?',
@@ -844,4 +853,7 @@ if __name__ == '__main__':
                 debug=args.debug)
     pool.run()
 
+
+if __name__ == '__main__':
+    main()
     sys.exit(0)

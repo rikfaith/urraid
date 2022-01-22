@@ -8,6 +8,7 @@ DLIST:=missing-function-docstring,missing-module-docstring
 DLIST:=$(DLIST),missing-class-docstring,too-few-public-methods
 DLIST:=$(DLIST),too-many-arguments,too-many-locals,too-many-instance-attributes
 DLIST:=$(DLIST),too-many-branches,too-many-statements
+DLIST:=$(DLIST),too-many-lines,too-many-return-statements
 
 lint:
 	pep8 urraid.py

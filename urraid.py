@@ -6,6 +6,7 @@
 import argparse
 import concurrent.futures
 import configparser
+import getpass
 import multiprocessing
 import inspect
 import logging
@@ -16,6 +17,7 @@ import secrets
 import select
 import socket
 import sys
+import textwrap
 import time
 import traceback
 import typing
@@ -126,7 +128,7 @@ class Ssh():
         self.client.set_missing_host_key_policy(
             paramiko.client.AutoAddPolicy())
 
-        prefix = 'Cannot ssh to {user}@{self.remote}: '
+        prefix = f'Cannot ssh to {user}@{self.remote}: '
         try:
             self.client.connect(self.remote, username=user,
                                 timeout=self.timeout)
@@ -186,6 +188,7 @@ class Ssh():
         except Exception as exception:
             FATAL(f'Cannot open session to {self.user}@{self.remote}: '
                   '{}'.format(repr(exception)))
+        DEBUG(f'  {self.user}@{self.remote}: {command}')
         # Get a pty so that stderr will be combined with stdout. Otherwise, we
         # only get stderr if there is any output on stderr.
         channel.get_pty()
@@ -200,6 +203,7 @@ class Ssh():
                     continue
                 result.append(line)
         exit_status = channel.recv_exit_status()
+        DEBUG(f'  exit_status={exit_status}')
         return result, exit_status
 
 
@@ -263,16 +267,21 @@ class Config():
 
 class Raid():
     # pylint: disable=invalid-name
-    def __init__(self, name, remote, config, command, lvsvolume,
+    def __init__(self, name, remote, config, command, lvsvolume, devices,
                  mqueue, debug=False, timeout=5):
         self.name = name
         self.remote = remote
         self.config = config
         self.command = command
         self.lvsvolume = lvsvolume
+        self.devices = devices
         self.mqueue = mqueue
         self.debug = debug
         self.timeout = timeout
+
+        # For pylint, these must be defined in __init__
+        self.drives = {}
+        self.partitions = {}
 
         self.user = self.config.get_value(remote, 'username')
         if self.user is None:
@@ -280,16 +289,15 @@ class Raid():
         elif isinstance(self.user, list):
             self.user = self.user[0]
 
-        self.partitions = None  # for pylint
         self._clear_status()
         self.ssh = Ssh(self.remote, self.user, debug=self.debug,
                        timeout=self.timeout)
 
     def INFO(self, message):
-        self.mqueue.put((self.name, message))
+        self.mqueue.put((self.name, 'I', message))
 
     def FATAL(self, message) -> typing.NoReturn:
-        self.mqueue.put((self.name, message))
+        self.mqueue.put((self.name, 'F', message))
         sys.exit(1)
 
     def _dump(self, result):
@@ -297,15 +305,50 @@ class Raid():
             self.INFO(line)
 
     def _get_partitions(self):
-        if self.partitions is None:
-            self.partitions, _ = self.ssh.execute('cat /proc/partitions')
+        if len(self.partitions) > 0:
+            return
+        result, status = self.ssh.execute('cat /proc/partitions')
+        if status:
+            self.partitions = {}
+            return
+        for line in result:
+            # Skip the header
+            if line.startswith('major') or line == '':
+                continue
+
+            _, _, blocks, name = line.split()
+            # Skip bogus partitions on the md devices
+            if re.search(r'md\d+p\d+', name):
+                continue
+
+            if int(blocks) < 2:
+                # Extended partitions are 1 block long
+                continue
+            self.partitions[os.path.join('/dev/', name)] = int(blocks) * 1024
+
+    def _get_drives(self):
+        if len(self.drives) > 0:
+            return
+        result, status = self.ssh.execute('lsscsi -bSS')
+        if status:
+            self.drives = {}
+            return
+        for line in result:
+            _, dev, size = line.split()
+            if dev == '-' or size == '-':
+                continue
+            blocks, block_size = size.split(',')
+            size_bytes = int(blocks) * int(block_size)
+            if size_bytes > 0:
+                self.drives[dev] = size_bytes
 
     def _clear_status(self):
         self.uuid_devs = {}
         self.uuid_md = {}
         self.mds = set()
         self.encrypted = set()
-        self.partitions = None
+        self.partitions = {}
+        self.drives = {}
         self.mapping = {}
         self.sizes = {}
         self.level = {}
@@ -317,17 +360,16 @@ class Raid():
 
     def _get_status(self):
         self._clear_status()
+        self._get_drives()
         self._get_partitions()
         DEBUG('determining device status')
-        for partition in self.partitions:
-            if partition.startswith('major') or partition == '':
-                continue
-            _, _, _, name = partition.split()
-            dev = os.path.join("/dev/", name)
+        for dev in self.partitions:
+            name = os.path.basename(dev)
 
             # For the non-md devices, determine the UUID of the md of the
             # associated md device, if applicable.
             result, _ = self.ssh.execute(f'mdadm -Q --examine {dev}')
+            # Ignore the status so that we always get a --detail on md devices.
             for line in result:
                 if re.search(r'Array UUID : ', line):
                     uuid = re.sub('.* UUID : ', '', line).strip()
@@ -344,7 +386,9 @@ class Raid():
 
             # For all of the md devices, determine the UUID of the md.
             uuid = None
-            result, _ = self.ssh.execute(f'mdadm -Q --detail {dev}')
+            result, status = self.ssh.execute(f'mdadm -Q --detail {dev}')
+            if status:
+                continue
             for line in result:
                 if re.search(r'UUID : ', line):
                     uuid = re.sub('.* UUID : ', '', line).strip()
@@ -353,6 +397,9 @@ class Raid():
                 if uuid and re.search(r'Failed Devices :', line):
                     failed = re.sub('.* Devices : ', '', line).strip()
                     self.failed[uuid] = int(failed)
+
+        DEBUG(f'found {len(self.uuid_devs)} UUIDs among'
+              f' {len(self.partitions)} partitions')
 
         # Determine encryption status. If the header is detached, we can make
         # a determination from the uuid without the md device.
@@ -441,62 +488,21 @@ class Raid():
         self.FATAL('More than 10 volumes not supported')
 
     @staticmethod
-    def _human(size):
+    def _human(size, metric=False):
         if size == '':
             return ''
         size = int(size)
-        units = ['b', 'KiB', 'MiB', 'GiB', 'TiB']
+        if metric:
+            divisor = 1000
+            units = ['b', 'KB', 'MB', 'GB', 'TB']
+        else:
+            divisor = 1024
+            units = ['b', 'KiB', 'MiB', 'GiB', 'TiB']
         unit = 0
-        while size > 1024 and unit < len(units) - 1:
-            size /= 1024
+        while size > divisor and unit < len(units) - 1:
+            size /= divisor
             unit += 1
         return f'{size:.2f}{units[unit]}'
-
-    def status(self):
-        self._get_status()
-        # Report md devices
-        for uuid, devs in self.uuid_devs.items():
-            devs = ' '.join(sorted(devs))
-            md = self.uuid_md.get(uuid, '')
-            size, _ = self.sizes.get(uuid, ('', ''))
-            size = self._human(size)
-            level = self.level.get(uuid, '')
-            failed = self.failed.get(uuid, 0)
-            self.INFO(
-                f'{md:5s} {uuid:35s} {size:10s} {level:6s} {failed} {devs}')
-
-            if failed > 0:
-                self.INFO(f'{uuid:41s} {failed} device(s) FAILED **********')
-
-        # Report volume mappings
-        for volume, deps in self.mapping.items():
-            deps = ' '.join(sorted(deps))
-            size, _ = self.sizes.get(volume, ('', ''))
-            size = self._human(size)
-            self.INFO(f'{volume:41s} {size:17s} {deps}')
-        # Report mounts
-        for volume, (mountpoint, fstype) in self.mounts.items():
-            size, used = self.sizes.get(mountpoint, ('', ''))
-            free = self._human(int(size) - int(used))
-            size = self._human(size)
-            self.INFO(
-                f'{mountpoint:30s} {free:10s} {size:10s} {fstype:6s} {volume}')
-
-    def _get_luks_key(self, uuid):
-        # pylint: disable=broad-except
-        luks_key = ''
-        for key in ['key0', 'key1', 'key2', 'key3']:
-            key_remote = self.config.get_value(self.remote, key)
-            if key_remote is not None and len(key_remote) > 0:
-                try:
-                    secret = ursecret.UrSecret(key_remote[0],
-                                               socket.gethostname(),
-                                               debug=self.debug)
-                    secret.locate_key()
-                    luks_key += secret.get_secret(uuid)
-                except Exception:
-                    pass
-        return luks_key
 
     def _md5up(self):
         self._get_status()
@@ -521,6 +527,45 @@ class Raid():
             dev = os.path.join("/dev/", name)
             result, _ = self.ssh.execute(f'mdadm -S {dev}')
             self._dump(result)
+
+    def _md5create(self, partitions, level=6):
+        name = self._get_next_mdname()
+        result, status = self.ssh.execute(
+            f'mdadm -C /dev/{name} --verbose -n {len(partitions)} -l {level}'
+            f' {" ".join(partitions)}',
+            prompt='Continue creating array?',
+            data='YES')
+        self._dump(result)
+        if status != 0:
+            self.FATAL('cannot create {name}')
+
+        self.INFO('setting stripe_cache_size')
+        result, status = self.ssh.execute(
+            f'echo 32768 > /sys/block/{name}/md/stripe_cache_size')
+        self._dump(result)
+        if status != 0:
+            self.FATAL('could not set stripe_cache_size')
+
+        self.INFO('updating /etc/mdadm/mdadm.conf')
+        result, status = self.ssh.execute('/usr/share/mdadm/mkconf')
+        if status != 0:
+            self.FATAL('cannot run /usr/share/mdadm/mkconf')
+        for line in result:
+            if line.startswith('ARRAY'):
+                _, _, meta, uuid, name = line.split()
+                _, status = self.ssh.execute(
+                    f'echo "ARRAY <ignore> {meta} {uuid} {name}"'
+                    ' >> /etc/mdadm/mdadm.conf')
+                if status != 0:
+                    self.FATAL('could not update /etc/mdadm/mdadm.conf')
+
+        self.INFO('updating initramfs')
+        result, status = self.ssh.execute('update-initramfs -u')
+        self._dump(result)
+        if status != 0:
+            self.FATAL('cannot update initramfs')
+
+        return name
 
     def _create_luks_header(self, uuid):
         _, status = self.ssh.execute(f'test -f {uuid}.header')
@@ -673,6 +718,127 @@ class Raid():
                 result, _ = self.ssh.execute(f'/etc/init.d/{service} stop')
             self._dump(result)
 
+    def _get_luks_key(self, uuid):
+        # pylint: disable=broad-except
+        luks_key = ''
+        for key in ['key0', 'key1', 'key2', 'key3']:
+            key_remote = self.config.get_value(self.remote, key)
+            if key_remote is not None and len(key_remote) > 0:
+                try:
+                    secret = ursecret.UrSecret(key_remote[0],
+                                               socket.gethostname(),
+                                               debug=self.debug)
+                    secret.locate_key()
+                    luks_key += secret.get_secret(uuid)
+                except Exception:
+                    pass
+        return luks_key
+
+    def _rightsize(self, size):
+        '''
+        Historic data is as follows:
+        8TB drives, size = 7630885, rightsize = 7630880, loss=6
+        6TB drives, size = 5723167, rightsize = 5723164, loss=3
+        5TB drives, size = 4769307, rightsize = 4769300, loss=7
+        4TB drives, size = 3815448, rightsize = 3815400, loss=48
+                    on char: 3815440
+        3TB drives, size = 2861588, rightsize = 2861536, loss=52
+                    previously: 2861588 and 2861312
+        2TB drives, size = 1907729, rightsize = 1907711
+        1TB drives, size = 953868 , rightsize = 953864, loss=4
+
+        The goal moving forward is to return a value in MiB that is
+        smaller than the current size, but that is a multiple of 8.
+        '''
+        tb = int(size / 1000**4 + .5)
+        if tb == 1:
+            return 953864
+        if tb == 2:
+            return 1907711
+        if tb == 3:
+            return 2861536
+        if tb == 4:
+            return 3815400
+        if tb == 5:
+            return 4769300
+        if tb == 6:
+            return 5723164
+        if tb == 8:
+            return 7630880
+        if tb == 12:
+            return 11444216
+
+        mb = int(size / 1024)
+        mb = int(mb / 1024)
+        mb = int((mb-1) / 8) * 8
+        self.FATAL(f'Cannot rightsize {size} bytes == {tb}TB, suggest {mb}')
+
+    def _partition(self, dev, rightsize):
+        self.INFO(f'creating gpt label on {dev}')
+        result, status = self.ssh.execute(f'parted -s {dev} mklabel gpt')
+        self._dump(result)
+        if status != 0:
+            self.FATAL(f'cannot create gpt label on {dev}')
+
+        self.INFO(f'creating {rightsize}MiB partition on {dev}')
+        result, status = self.ssh.execute(
+            f'parted -s {dev} -- unit mib mkpart primary ext4 1 {rightsize}')
+        self._dump(result)
+        if status != 0:
+            self.FATAL(f'cannot create partition on {dev}')
+
+        self.INFO(f'setting raid flag on partition 1 of {dev}')
+        result, status = self.ssh.execute(f'parted -s {dev} set 1 raid on')
+        self._dump(result)
+        if status != 0:
+            self.FATAL(f'could not set raid flag on partition 1 of {dev}')
+
+        result, _ = self.ssh.execute(f'parted -s {dev} -- unit mib print')
+        self._dump(result)
+        self.INFO(f'{dev} partitioned')
+
+    def status(self):
+        self._get_status()
+        # Report on drives
+        for dev, size in self.drives.items():
+            self.INFO(f'{os.path.basename(dev):10s}'
+                      f' {self._human(size, metric=True):>40s}')
+
+        # Report on partitions
+        for part, size in sorted(self.partitions.items()):
+            if not re.search(r'\d$', part):
+                continue
+            self.INFO(f'{os.path.basename(part):10s}'
+                      f' {self._human(size, metric=True):>40s}')
+
+        # Report md devices
+        for uuid, devs in self.uuid_devs.items():
+            devs = ' '.join(sorted(devs))
+            md = self.uuid_md.get(uuid, '')
+            size, _ = self.sizes.get(uuid, ('', ''))
+            size = self._human(size)
+            level = self.level.get(uuid, '')
+            failed = self.failed.get(uuid, 0)
+            self.INFO(
+                f'{md:5s} {uuid:35s} {size:10s} {level:6s} {failed} {devs}')
+
+            if failed > 0:
+                self.INFO(f'{uuid:41s} {failed} device(s) FAILED **********')
+
+        # Report volume mappings
+        for volume, deps in self.mapping.items():
+            deps = ' '.join(sorted(deps))
+            size, _ = self.sizes.get(volume, ('', ''))
+            size = self._human(size)
+            self.INFO(f'{volume:41s} {size:17s} {deps}')
+        # Report mounts
+        for volume, (mountpoint, fstype) in self.mounts.items():
+            size, used = self.sizes.get(mountpoint, ('', ''))
+            free = self._human(int(size) - int(used))
+            size = self._human(size)
+            self.INFO(
+                f'{mountpoint:30s} {free:10s} {size:10s} {fstype:6s} {volume}')
+
     def up(self):
         DEBUG('bringing services down')
         self._services(start=False)
@@ -711,6 +877,42 @@ class Raid():
         self.up()
         self.INFO(f'manually run mke2fs {self.lvsvolume}')
 
+    def partition(self):
+        self.status()
+        size = 0
+        for dev in self.devices.split(','):
+            if dev not in self.drives:
+                self.FATAL('{dev} does not exist')
+            if size == 0:
+                size = self.drives[dev]
+            if size != self.drives[dev]:
+                self.FATAL(f'{dev} has unexpected size: '
+                           f'{self.drives[dev]} instead of {size}')
+        rightsize = self._rightsize(size)
+        self.INFO(f'Rightsizing {size} to {rightsize}')
+        for dev in self.devices.split(','):
+            self._partition(dev, rightsize)
+
+    def make_raid(self):
+        self.status()
+        size = 0
+        partitions = []
+        for part in self.devices.split(','):
+            partitions.append(part)
+            if part not in self.partitions:
+                self.FATAL(f'{part} does not exist')
+            if not re.search(r'\d$', part):
+                self.FATAL(f'{part} must specify a partition, not a drive')
+            if size == 0:
+                size = self.partitions[part]
+            if size != self.partitions[part]:
+                self.FATAL(f'{part} has unexpected size: '
+                           f'{self.partitions[part]} instead of {size}')
+        self.INFO(f'creating raid using {len(partitions)} partitions of size'
+                  f' {self._human(size,metric=True)}')
+        name = self._md5create(partitions)
+        self.INFO(f'created {name} using {len(partitions)} partitions')
+
     def run(self):
         if self.command == 'status':
             self.status()
@@ -720,27 +922,32 @@ class Raid():
             self.down()
         elif self.command == 'CREATE':
             self.create()
+        elif self.command == 'PARTITION':
+            self.partition()
+        elif self.command == 'MAKERAID':
+            self.make_raid()
         else:
-            FATAL(f'Illegal command: {self.command}')
+            self.FATAL(f'Illegal command: {self.command}')
 
 
 class Pool():
     def __init__(self, remote_list, config, command, lvsvolume=None,
-                 debug=False, max_workers=4, timeout=5):
+                 devices=None, debug=False, max_workers=4, timeout=5):
         self.remote_list = remote_list
         self.config = config
         self.command = command
         self.lvsvolume = lvsvolume
+        self.devices = devices
         self.debug = debug
         self.max_workers = max_workers
         self.timeout = timeout
 
     @staticmethod
-    def _worker(name, remote, config, command, lvsvolume, mqueue,
+    def _worker(name, remote, config, command, lvsvolume, devices, mqueue,
                 debug=False, timeout=5):
         try:
-            raid = Raid(name, remote, config, command, lvsvolume, mqueue,
-                        debug=debug, timeout=timeout)
+            raid = Raid(name, remote, config, command, lvsvolume, devices,
+                        mqueue, debug=debug, timeout=timeout)
             raid.run()
         except Exception as exception:
             raise Exception(
@@ -780,6 +987,7 @@ class Pool():
                     self.config,
                     self.command,
                     self.lvsvolume,
+                    self.devices,
                     mqueue)
                 jobs[name] = future
 
@@ -789,8 +997,11 @@ class Pool():
             running = True
             while running:
                 try:
-                    name, message = mqueue.get(False)
-                    INFO('%s: %s', name, message)
+                    name, mtype, message = mqueue.get(False)
+                    if mtype == 'F':
+                        FATAL('%s: %s', name, message)
+                    else:
+                        INFO('%s: %s', name, message)
                 except queue.Empty:
                     running = False
                     for name, future in jobs.items():
@@ -798,19 +1009,41 @@ class Pool():
                     time.sleep(1)
 
             while not mqueue.empty():
-                name, message = mqueue.get(False)
-                INFO('%s: %s', name, message)
+                name, mtype, message = mqueue.get(False)
+                if mtype == 'F':
+                    FATAL('%s: %s', name, message)
+                else:
+                    INFO('%s: %s', name, message)
+
+
+def confirm(message):
+    result = input(message)
+    if result == 'YES':
+        return True
+    return False
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Configure, start, and stop remote data stores')
+        formatter_class=argparse.RawTextHelpFormatter,
+        description='Configure, start, and stop remote data stores',
+        epilog=textwrap.dedent('''
+        All UPPERCASE commands are DESTRUCTIVE and require:
+          1) an interactive response from the console; and
+          2) may only be run against a single target.'''))
     parser.add_argument('target', type=str, nargs='?',
                         help='target host or comma separated list of hosts')
     parser.add_argument('command', type=str, nargs='?',
-                        help='command (status|up|down|CREATE)')
+                        help='command (status|up|down|'
+                        'CREATE|PARTITION|MAKERAID)')
     parser.add_argument('--lvsvolume', type=str,
                         help='name of lvs volume for CREATE, e.g., v0-data')
+    parser.add_argument('--devices', type=str,
+                        help='comma-separated list for PARTITION, MAKERAID,\n'
+                        'e.g., /dev/sdb,/dev/sdc or /dev/sdb1,/dev/sdc1')
+    parser.add_argument('--partitions', type=str,
+                        help='comma-separated list for MAKERAID,\n'
+                        'e.g., /dev/sdb1,/dev/sdc1')
     parser.add_argument('--config', default=None,
                         help='configuration file')
     parser.add_argument('--dump', action='store_true', default=False,
@@ -824,8 +1057,8 @@ def main():
         Log.logger.setLevel(logging.DEBUG)
         logging.getLogger('paramiko').setLevel(logging.INFO)
 
-    INFO(f'target={args.target}')
-    INFO(f'command={args.command}')
+    DEBUG(f'target={args.target}')
+    DEBUG(f'command={args.command}')
 
     config = Config(args.config)
     if args.dump:
@@ -833,7 +1066,7 @@ def main():
         sys.exit(0)
 
     if args.target is None or args.command is None or args.command not in [
-            'status', 'up', 'down', 'CREATE']:
+            'status', 'up', 'down', 'CREATE', 'PARTITION', 'MAKERAID']:
         parser.print_help()
         sys.exit(1)
 
@@ -842,15 +1075,36 @@ def main():
     else:
         target_list = [args.target]
 
-    INFO(f'target_list={target_list}')
+    DEBUG(f'target_list={target_list}')
 
-    if args.command == 'CREATE' and (not args.lvsvolume or
-                                     len(target_list) > 1):
-        parser.print_help()
-        sys.exit(1)
+    if args.command == 'CREATE':
+        if not args.lvsvolume or len(target_list) > 1:
+            parser.print_help()
+            sys.exit(1)
+        result = confirm(f'Destroy data on {args.lvscolume}: YES or no? ')
+        if not result:
+            FATAL('No action taken -- must type "YES" to confirm')
+
+    if args.command == 'PARTITION':
+        if not args.devices or len(target_list) > 1:
+            parser.print_help()
+            sys.exit(1)
+
+        result = confirm(f'Destroy data on {args.devices}: YES or no? ')
+        if not result:
+            FATAL('No action taken -- must type "YES" to confirm')
+
+    if args.command == 'MAKERAID':
+        if not args.devices or len(target_list) > 1:
+            parser.print_help()
+            sys.exit(1)
+
+        result = confirm(f'Destroy data on {args.devices}: YES or no? ')
+        if not result:
+            FATAL('No action taken -- must type "YES" to confirm')
 
     pool = Pool(target_list, config, args.command, lvsvolume=args.lvsvolume,
-                debug=args.debug)
+                devices=args.devices, debug=args.debug)
     pool.run()
 
 

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # urraid.py -*-python-*-
-# Copyright 2021 by Rik Faith (rikfaith@users.noreply.github.com)
+# Copyright 2021, 2022 by Rik Faith (rikfaith@users.noreply.github.com)
 # This program comes with ABSOLUTELY NO WARRANTY.
 
 import argparse
 import concurrent.futures
 import configparser
-import getpass
 import multiprocessing
 import inspect
 import logging
@@ -16,6 +15,7 @@ import re
 import secrets
 import select
 import socket
+import subprocess
 import sys
 import textwrap
 import time
@@ -29,15 +29,6 @@ except ImportError as e:
     print(f'''\
 # Cannot load paramiko: {e}
 # Consider: apt-get install python3-paramiko''')
-    raise SystemExit from e
-
-sys.path.insert(1, os.path.join(sys.path[0], '../ursecret'))
-try:
-    import ursecret
-except ImportError as e:
-    print(f'''\
-# Cannot load ursecret: {e}
-# sys.path={sys.path}''')
     raise SystemExit from e
 
 
@@ -110,27 +101,70 @@ Log()
 
 
 class Ssh():
-    def __init__(self, remote, user, debug=False, timeout=5):
+    def __init__(self, remote, user, port=22, privkey=None, timeout=5):
         self.remote = remote
         self.user = user
-        self.debug = debug
+        self.port = port
+        self.privkey = privkey
         self.timeout = timeout
 
+        self._parse_ssh_config()
+
         self.client = None
-        result = self._connect(self.user)
+        if self.privkey is None:
+            result = self._connect()
+        else:
+            result = self._connect_using_privkey()
         if result is not None:
             FATAL(result)
 
-    def _connect(self, user):
-        # pylint: disable=broad-except
+    def _parse_ssh_config(self):
+        filename = os.path.expanduser('~/.ssh/config')
+        if not os.path.exists(filename):
+            return
+        config = paramiko.config.SSHConfig.from_path(filename)
+        info = config.lookup(self.remote)
+        if info is None or len(info) == 0:
+            return
+        if 'hostname' in info:
+            self.remote = info['hostname']
+        if 'port' in info:
+            self.port = info['port']
+        if 'user' in info:
+            self.user = info['user']
+
+    def _connect(self):
         self.client = paramiko.client.SSHClient()
         self.client.load_system_host_keys()
         self.client.set_missing_host_key_policy(
             paramiko.client.AutoAddPolicy())
 
-        prefix = f'Cannot ssh to {user}@{self.remote}: '
+        prefix = f'cannot ssh to {self.user}@{self.remote}:{self.port}: '
+
+        # pylint: disable=broad-except
         try:
-            self.client.connect(self.remote, username=user,
+            self.client.connect(self.remote, username=self.user,
+                                port=self.port, timeout=self.timeout)
+        except paramiko.ssh_exception.PasswordRequiredException:
+            return prefix + 'Invalid username, or password required'
+        except Exception as exception:
+            return prefix + str(exception)
+        return None
+
+    def _connect_using_privkey(self):
+        self.client = paramiko.client.SSHClient()
+        self.client.load_system_host_keys()
+        self.client.set_missing_host_key_policy(
+            paramiko.client.AutoAddPolicy())
+
+        prefix = f'cannot ssh to {self.user}@{self.remote}:{self.port}' + \
+            ' using privkey: '
+
+        # pylint: disable=broad-except
+        try:
+            self.client.connect(self.remote, username=self.user,
+                                port=self.port, key_filename=self.privkey,
+                                look_for_keys=False, allow_agent=False,
                                 timeout=self.timeout)
         except paramiko.ssh_exception.PasswordRequiredException:
             return prefix + 'Invalid username, or password required'
@@ -191,7 +225,9 @@ class Ssh():
         DEBUG(f'  {self.user}@{self.remote}: {command}')
         # Get a pty so that stderr will be combined with stdout. Otherwise, we
         # only get stderr if there is any output on stderr.
-        channel.get_pty()
+        if self.privkey is None:
+            # Only get a pty if we have a normal shell on the remote.
+            channel.get_pty()
         channel.exec_command(command)
         while not channel.exit_status_ready():
             for line in self._linesplit(channel, timeout=timeout,
@@ -205,6 +241,205 @@ class Ssh():
         exit_status = channel.recv_exit_status()
         DEBUG(f'  exit_status={exit_status}')
         return result, exit_status
+
+
+class Secret():
+    def __init__(self, remote, local, user=None, timeout=5):
+        self.remote = remote
+        self.local = local
+        self.user = user
+        self.timeout = timeout
+        self.helper = 'ursecret-helper.py'
+        self.privkey = None
+        self.pubkey = None
+        self.ssh = None
+
+    def _locate_key(self):
+        dirname = os.path.expanduser('~/.ssh')
+        with os.scandir(dirname) as scandir:
+            for entry in scandir:
+                if re.search(f'{self.remote}-ursecret-{self.local}',
+                             entry.name) and entry.is_file():
+                    if entry.name.endswith('.pub'):
+                        self.pubkey = os.path.join(dirname, entry.name)
+                    else:
+                        self.privkey = os.path.join(dirname, entry.name)
+        DEBUG(f'located {self.privkey}')
+
+    def _connect(self, use_privkey=False):
+        if use_privkey:
+            self._locate_key()
+            self.ssh = Ssh(self.remote, self.user, timeout=self.timeout,
+                           privkey=self.privkey)
+        else:
+            self.ssh = Ssh(self.remote, self.user, timeout=self.timeout)
+
+    def _find_key_type(self):
+        result, status = self.ssh.execute('ssh -Q key')
+        if status != 0:
+            FATAL('cannot determine available key types')
+        key_type = 'rsa'
+        for line in result:
+            if re.search(line, 'ssh-ed25519'):
+                key_type = 'ed25519'
+                return key_type  # This is the best, so return immediately
+            if re.search(line, 'ecdsa', line):
+                key_type = 'ecdsa'  # Keep looking for a better type
+        return key_type
+
+    def _generate_key(self):
+        key_type = self._find_key_type()
+        filename = os.path.join(os.path.expanduser('~/.ssh'),
+                                f'{self.remote}-ursecret-{self.local}')
+        if os.path.exists(filename) or os.path.exists(filename + '.pub'):
+            FATAL(f'will not overwrite existing key in {filename}')
+        current_time = time.strftime('%Y%m%d-%H%M%S')
+        command = ['ssh-keygen',
+                   '-f',
+                   filename,
+                   '-C',
+                   f'{self.user}@{self.remote}-{self.local}-{current_time}',
+                   '-N',
+                   '']
+        if key_type == 'rsa':
+            command.extend(['-t', 'rsa', '-b', '4096'])
+        elif key_type == 'ecdsa':
+            command.extend(['-t', 'ecdsa', '-b', '521'])
+        elif key_type == 'ed25519':
+            command.extend(['-t', 'ed25519', '-a', '100'])
+        else:
+            FATAL(f'unknown key_type: {key_type}')
+        INFO(f'generating key with: {" ".join(command)}')
+        with subprocess.Popen(command, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE) as proc:
+            results = proc.communicate()[0]
+            proc.wait()
+        for result in results.split():
+            DEBUG(result)
+        self.privkey = filename
+        self.pubkey = filename + '.pub'
+
+    def _install_helper(self):
+        helper = f'''#!/usr/bin/env python3
+# {self.helper} -*-python-*-'''
+        helper += '''
+import os
+import sys
+
+
+class Secret():
+    def __init__(self):
+        self.dirname = os.path.expanduser('~/.ursecret')
+        self.envname = 'SSH_ORIGINAL_COMMAND'
+
+        if not os.path.isdir(self.dirname):
+            os.mkdir(self.dirname, 0o700)
+
+        if self.envname not in os.environ:
+            self.fatal('invalid command')
+
+        self.args = os.environ[self.envname].split()
+        if len(self.args) <= 1:
+            self.fatal('invalid command')
+
+    def fatal(self, message):
+        print('F: {}: {}'.format(message, self.args), file=sys.stderr)
+        sys.exit(1)
+
+    def get(self, key):
+        filename = os.path.join(self.dirname, key)
+        if not os.path.exists(filename):
+            self.fatal('unknown key')
+        with open(filename, 'r') as fp:
+            value = fp.read()
+        print(value)
+
+    def put(self, key, value):
+        filename = os.path.join(self.dirname, key)
+        with open(filename, 'w') as fp:
+            fp.write(value)
+        print('I: key written to {}'.format(filename))
+
+    def run(self):
+        if self.args[0] == 'get':
+            if len(self.args) != 2:
+                self.fatal('illegal get')
+            self.get(self.args[1])
+        elif self.args[0] == 'put':
+            if len(self.args) != 3:
+                self.fatal('illegal put')
+            self.put(self.args[1], self.args[2])
+        else:
+            self.fatal('illegal command')
+
+
+if __name__ == '__main__':
+    s = Secret()
+    s.run()
+    sys.exit(0)
+'''
+
+        INFO(f'installing {self.helper} on {self.remote}')
+        with self.ssh.client.open_sftp() as ftp:
+            file = ftp.file(f'.ssh/{self.helper}', 'w')
+            file.write(helper)
+            file.flush()
+            ftp.chmod(f'.ssh/{self.helper}', 0o700)
+        INFO(f'{self.helper} installed on {self.remote}')
+
+    def _check_authorized_keys(self):
+        result, status = self.ssh.execute('cat ~/.ssh/authorized_keys')
+        if status != 0:
+            return False
+        for line in result:
+            DEBUG(f'Read: {line}')
+            if re.search(f'{self.helper}.*{self.remote}-{self.local}', line):
+                return True
+        return False
+
+    def _install_key(self):
+        INFO(f'installing key on {self.user}@{self.remote}')
+        with self.ssh.client.open_sftp() as ftp:
+            file = ftp.file('.ssh/authorized_keys', 'a')
+            with open(self.pubkey, 'r', encoding='utf-8') as fp:
+                for line in fp:
+                    file.write(f'command="./.ssh/{self.helper}",'
+                               'no-agent-forwarding,no-port-forwarding,no-pty,'
+                               'no-user-rc,no-x11-forwarding ' + line)
+            file.flush()
+
+    def get_secret(self, key):
+        self._connect(use_privkey=True)
+        result, status = self.ssh.execute(f'get {key}')
+        if status != 0:
+            ERROR(f'could not get key={key}')
+            for line in result:
+                ERROR(f'{self.remote}: {line.strip()}')
+            return ''
+        value = None
+        for line in result:
+            value = line.strip()
+            break
+        return value
+
+    def put_secret(self, key, value):
+        self._connect(use_privkey=True)
+        result, status = self.ssh.execute(f'put {key} {value}')
+        if status != 0:
+            ERROR(f'could not put key={key} value={value}')
+            for line in result:
+                ERROR(f'{self.remote}: {line.strip()}')
+
+    def install(self):
+        self._connect()
+        self._install_helper()
+        if self._check_authorized_keys():
+            FATAL(f'key for {self.remote}-{self.local} found on '
+                  f'{self.remote}: will not replace')
+        INFO(f'no key for {self.remote}-{self.local} found on '
+             f'{self.remote}: will install now')
+        self._generate_key()
+        self._install_key()
 
 
 class Config():
@@ -222,7 +457,7 @@ class Config():
         self._parse_configs()
 
     def _parse_configs(self):
-        DEBUG('self.paths={self.paths}')
+        DEBUG(f'self.paths={self.paths}')
         for path in self.paths:
             filename = os.path.expanduser(path)
             if os.path.exists(filename):
@@ -243,14 +478,14 @@ class Config():
             return values
         return None
 
-    def get_value(self, target, key):
+    def get_value(self, target, key, default=None):
         # Return value from section [target]
         value = self._get_value(target, key)
         if value:
             return value
 
         # Maybe implement a [default] section in the future?
-        return None
+        return default
 
     def dump(self):
         output = ''
@@ -268,7 +503,7 @@ class Config():
 class Raid():
     # pylint: disable=invalid-name
     def __init__(self, name, remote, config, command, lvsvolume, devices,
-                 mqueue, debug=False, timeout=5):
+                 mqueue, timeout=5):
         self.name = name
         self.remote = remote
         self.config = config
@@ -276,7 +511,6 @@ class Raid():
         self.lvsvolume = lvsvolume
         self.devices = devices
         self.mqueue = mqueue
-        self.debug = debug
         self.timeout = timeout
 
         # For pylint, these must be defined in __init__
@@ -290,8 +524,7 @@ class Raid():
             self.user = self.user[0]
 
         self._clear_status()
-        self.ssh = Ssh(self.remote, self.user, debug=self.debug,
-                       timeout=self.timeout)
+        self.ssh = Ssh(self.remote, self.user, timeout=self.timeout)
 
     def INFO(self, message):
         self.mqueue.put((self.name, 'I', message))
@@ -590,11 +823,9 @@ class Raid():
             for key in ['key0', 'key1', 'key2', 'key3']:
                 key_remote = self.config.get_value(self.remote, key)
                 if key_remote is not None and len(key_remote) > 0:
-                    secret = ursecret.UrSecret(key_remote[0],
-                                               socket.gethostname(),
-                                               debug=self.debug)
+                    secret = Secret(key_remote[0], socket.gethostname(),
+                                    self.user)
                     partial = secrets.token_hex(64)
-                    secret.locate_key()
                     secret.put_secret(uuid, partial)
             luks_key = self._get_luks_key(uuid)
             if luks_key == '':
@@ -725,10 +956,8 @@ class Raid():
             key_remote = self.config.get_value(self.remote, key)
             if key_remote is not None and len(key_remote) > 0:
                 try:
-                    secret = ursecret.UrSecret(key_remote[0],
-                                               socket.gethostname(),
-                                               debug=self.debug)
-                    secret.locate_key()
+                    secret = Secret(key_remote[0], socket.gethostname(),
+                                    self.user)
                     luks_key += secret.get_secret(uuid)
                 except Exception:
                     pass
@@ -802,14 +1031,16 @@ class Raid():
         # Report on drives
         for dev, size in self.drives.items():
             self.INFO(f'{os.path.basename(dev):10s}'
-                      f' {self._human(size, metric=True):>40s}')
+                      f' {self._human(size, metric=True):>28s}'
+                      f' = {self._human(size):>10s}')
 
         # Report on partitions
         for part, size in sorted(self.partitions.items()):
             if not re.search(r'\d$', part):
                 continue
             self.INFO(f'{os.path.basename(part):10s}'
-                      f' {self._human(size, metric=True):>40s}')
+                      f' {self._human(size, metric=True):>28s}'
+                      f' = {self._human(size):>10s}')
 
         # Report md devices
         for uuid, devs in self.uuid_devs.items():
@@ -820,7 +1051,7 @@ class Raid():
             level = self.level.get(uuid, '')
             failed = self.failed.get(uuid, 0)
             self.INFO(
-                f'{md:5s} {uuid:35s} {size:10s} {level:6s} {failed} {devs}')
+                f'{md:5s} {uuid:35s} {size:>10s} {level:6s} {failed} {devs}')
 
             if failed > 0:
                 self.INFO(f'{uuid:41s} {failed} device(s) FAILED **********')
@@ -830,14 +1061,14 @@ class Raid():
             deps = ' '.join(sorted(deps))
             size, _ = self.sizes.get(volume, ('', ''))
             size = self._human(size)
-            self.INFO(f'{volume:41s} {size:17s} {deps}')
+            self.INFO(f'{volume:41s} {size:>10s} {deps}')
         # Report mounts
         for volume, (mountpoint, fstype) in self.mounts.items():
             size, used = self.sizes.get(mountpoint, ('', ''))
             free = self._human(int(size) - int(used))
             size = self._human(size)
-            self.INFO(
-                f'{mountpoint:30s} {free:10s} {size:10s} {fstype:6s} {volume}')
+            self.INFO(f'{mountpoint:25s} free={free:>10s} {size:>10s}'
+                      f' {fstype:6s} {volume}')
 
     def up(self):
         DEBUG('bringing services down')
@@ -932,22 +1163,21 @@ class Raid():
 
 class Pool():
     def __init__(self, remote_list, config, command, lvsvolume=None,
-                 devices=None, debug=False, max_workers=4, timeout=5):
+                 devices=None, max_workers=4, timeout=5):
         self.remote_list = remote_list
         self.config = config
         self.command = command
         self.lvsvolume = lvsvolume
         self.devices = devices
-        self.debug = debug
         self.max_workers = max_workers
         self.timeout = timeout
 
     @staticmethod
     def _worker(name, remote, config, command, lvsvolume, devices, mqueue,
-                debug=False, timeout=5):
+                timeout=5):
         try:
             raid = Raid(name, remote, config, command, lvsvolume, devices,
-                        mqueue, debug=debug, timeout=timeout)
+                        mqueue, timeout=timeout)
             raid.run()
         except Exception as exception:
             raise Exception(
@@ -1028,6 +1258,22 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         description='Configure, start, and stop remote data stores',
         epilog=textwrap.dedent('''
+
+        Low-level manipulation of keys using --install, --get, and --put
+        do NOT specify a COMMAND. The TARGET in these cases is the remote
+        that is storing the key; NOT the remote that contains the storage.
+
+        High-level Storage Commands:
+
+        status: obtain status
+        up: bring up data store
+        down: shut down data store
+        PARTITION: add gpt partition to a set of disk drives
+        MAKERAID: create an md raid from a set of partitions
+        CREATE: generate keys and store them as specified in ~/.urraid,
+                format LUKS encrypted volume on an md raid,
+                create an LVS volume with the specified name
+
         All UPPERCASE commands are DESTRUCTIVE and require:
           1) an interactive response from the console; and
           2) may only be run against a single target.'''))
@@ -1037,7 +1283,7 @@ def main():
                         help='command (status|up|down|'
                         'CREATE|PARTITION|MAKERAID)')
     parser.add_argument('--lvsvolume', type=str,
-                        help='name of lvs volume for CREATE, e.g., v0-data')
+                        help='name of LVS volume for CREATE, e.g., v0-data')
     parser.add_argument('--devices', type=str,
                         help='comma-separated list for PARTITION, MAKERAID,\n'
                         'e.g., /dev/sdb,/dev/sdc or /dev/sdb1,/dev/sdc1')
@@ -1050,6 +1296,13 @@ def main():
                         help='dump config file and exit')
     parser.add_argument('--debug', action='store_true', default=False,
                         help='verbose debugging output')
+    parser.add_argument('--install', action='store_true', default=False,
+                        help='install ssh key between localhost and TARGET')
+    parser.add_argument('--get', type=str, default=None,
+                        help='get named secret from TARGET', metavar='KEY')
+    parser.add_argument('--put', type=str, default=None, nargs=2,
+                        help='put named secret to TARGET',
+                        metavar=('KEY', 'VALUE'))
     args = parser.parse_args()
 
     logging.getLogger('paramiko').setLevel(logging.WARNING)
@@ -1057,12 +1310,46 @@ def main():
         Log.logger.setLevel(logging.DEBUG)
         logging.getLogger('paramiko').setLevel(logging.INFO)
 
-    DEBUG(f'target={args.target}')
-    DEBUG(f'command={args.command}')
-
     config = Config(args.config)
     if args.dump:
         INFO(f'config={config.dump()}')
+        sys.exit(0)
+
+    target_list = []
+    if args.target:
+        if re.search(',', args.target):
+            target_list = args.target.split(',')
+        else:
+            target_list = [args.target]
+
+    if args.install:
+        if len(target_list) > 1 or args.command or args.get or args.put:
+            parser.print_help()
+            sys.exit(1)
+        secret = Secret(target_list[0], socket.gethostname(),
+                        user=config.get_value(target_list[0], 'username',
+                                              'root'))
+        secret.install()
+        sys.exit(0)
+
+    if args.put:
+        if len(target_list) > 1 or args.command or args.install or args.get:
+            parser.print_help()
+            sys.exit(1)
+        secret = Secret(target_list[0], socket.gethostname(),
+                        user=config.get_value(target_list[0], 'username',
+                                              'root'))
+        secret.put_secret(*args.put)
+        sys.exit(0)
+
+    if args.get:
+        if len(target_list) > 1 or args.command or args.install or args.put:
+            parser.print_help()
+            sys.exit(1)
+        secret = Secret(target_list[0], socket.gethostname(),
+                        user=config.get_value(target_list[0], 'username',
+                                              'root'))
+        INFO(f'secret: {secret.get_secret(args.get)}')
         sys.exit(0)
 
     if args.target is None or args.command is None or args.command not in [
@@ -1070,18 +1357,11 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    if re.search(',', args.target):
-        target_list = args.target.split(',')
-    else:
-        target_list = [args.target]
-
-    DEBUG(f'target_list={target_list}')
-
     if args.command == 'CREATE':
         if not args.lvsvolume or len(target_list) > 1:
             parser.print_help()
             sys.exit(1)
-        result = confirm(f'Destroy data on {args.lvscolume}: YES or no? ')
+        result = confirm(f'Destroy data on {args.lvsvolume}: YES or no? ')
         if not result:
             FATAL('No action taken -- must type "YES" to confirm')
 
@@ -1104,7 +1384,7 @@ def main():
             FATAL('No action taken -- must type "YES" to confirm')
 
     pool = Pool(target_list, config, args.command, lvsvolume=args.lvsvolume,
-                devices=args.devices, debug=args.debug)
+                devices=args.devices)
     pool.run()
 
 

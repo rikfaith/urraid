@@ -738,7 +738,6 @@ class Raid():
         return f'{size:.2f}{units[unit]}'
 
     def _md5up(self):
-        self._get_status()
         # Bring up md devices
         for uuid in self.uuid_devs:
             if uuid in self.uuid_md:
@@ -750,7 +749,6 @@ class Raid():
             self._dump(result)
 
     def _md5down(self):
-        self._get_status()
         for uuid in self.uuid_devs:
             name = self.uuid_md.get(uuid)
             if name is None:
@@ -883,27 +881,46 @@ class Raid():
                 self.FATAL(f'could not decrypt {name}: {exit_status}')
 
     def _luksclose(self):
-        self._get_status()
         for pvs in self.pvs:
             path = os.path.join('/dev/mapper', pvs)
             self.INFO(f'closing {path}')
-            result, _ = self.ssh.execute(f'cryptsetup luksClose {path}')
+
+            result, status = self.ssh.execute(f'cryptsetup luksClose {path}')
             self._dump(result)
-            self.INFO(f'finished closing {path}')
+            if status == 0:
+                self.INFO(f'finished closing {path}')
+            else:
+                self.FATAL(f'could not close {path}')
 
     def _lvchange(self, on=False):
-        self._get_status()
         for lvs in self.lvs:
             path = os.path.join('/dev/mapper', lvs)
             if on:
                 self.INFO(f'activating {path}')
-                result, _ = self.ssh.execute(f'lvchange -ay {path}')
-                self.INFO(f'finished activating {path}')
+                result, status = self.ssh.execute(f'lvchange -ay {path}')
+                self._dump(result)
+                if status == 0:
+                    self.INFO(f'finished activating {path}')
+                else:
+                    self.FATAL(f'could not activate {path}')
             else:
                 self.INFO(f'deactivating {path}')
-                result, _ = self.ssh.execute(f'lvchange -an {path}')
-                self.INFO(f'finished deactivating {path}')
-            self._dump(result)
+                result, status = self.ssh.execute(f'lvchange -an {path}')
+                self._dump(result)
+                if status == 0:
+                    self.INFO(f'finished deactivating {path}')
+                else:
+                    self.FATAL(f'could not deactivating {path}')
+
+                self.INFO(f'checking if {path} is activated')
+                result, status = self.ssh.execute(f'lvs --rows {path}')
+                for line in result:
+                    if re.search(r'Attr ', line):
+                        attr = line.split()[1]
+                        if re.search(r'a', attr):
+                            self.INFO(f'{path} activated: {attr}')
+                        else:
+                            self.INFO(f'{path} deactivated: {attr}')
 
     def _mount(self):
         self._get_status()
@@ -933,7 +950,6 @@ class Raid():
             self.INFO(f'finished mounting {path} on {mountpoint}')
 
     def _umount(self):
-        self._get_status()
         for _, (mountpoint, _) in self.mounts.items():
             self.INFO(f'umounting {mountpoint}')
             result, _ = self.ssh.execute(f'umount {mountpoint}')
@@ -1071,12 +1087,14 @@ class Raid():
                       f' {fstype:6s} {volume}')
 
     def up(self):
+        self._get_status()
         DEBUG('bringing services down')
         self._services(start=False)
         DEBUG('bringing md devices up')
         self._md5up()
         DEBUG('opening LUKS devices')
         self._luksopen()
+        self._get_status()
         DEBUG('changing LV status')
         self._lvchange(on=True)
         DEBUG('mounting')
@@ -1087,14 +1105,18 @@ class Raid():
         self.status()
 
     def down(self):
+        self._get_status()
         DEBUG('bringing services down')
         self._services(start=False)
         DEBUG('unmounting')
         self._umount()
+
         DEBUG('changing LV status')
         self._lvchange(on=False)
         DEBUG('closing LUKS devices')
         self._luksclose()
+        DEBUG('stopping md devices')
+        self._md5down()
         DEBUG('down complete')
         self.status()
 

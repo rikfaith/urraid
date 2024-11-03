@@ -33,14 +33,40 @@ except ImportError as e:
 
 
 class Log():
+    """
+    A utility class that provides logging functionality.
+
+    The class provides a custom log formatter that adds the timestamp, caller
+    information, and process ID to the log messages. It also adds a custom log
+    level, 'FATAL', which is equivalent to level 50.
+
+    Attributes:
+        logger (logging.Logger): The logger object used for logging.
+        initial_level_set (bool): A flag indicating whether the logger's level
+            has been set initially or not.
+    """
     logger = None
     initial_level_set = False
 
     class LogFormatter(logging.Formatter):
+        """
+        A custom log formatter that adds the timestamp, caller information, and
+        process ID to the log messages.
+
+        """
         def __init__(self):
             logging.Formatter.__init__(self)
 
         def format(self, record):
+            """
+            Formats the log record with the custom log format.
+
+            Args:
+                record (logging.LogRecord): The log record to format.
+
+            Returns:
+                str: The formatted log record.
+            """
             # pylint: disable=consider-using-f-string
             level = record.levelname[0]
             date = time.localtime(record.created)
@@ -58,6 +84,11 @@ class Log():
             return logging.Formatter.format(self, record)
 
     def __init__(self):
+        """
+        Initializes the logger with a custom formatter and default logging
+        level of INFO.
+
+        """
         Log.logger = logging.getLogger()
         logging.addLevelName(50, 'FATAL')
         handler = logging.StreamHandler()
@@ -67,6 +98,18 @@ class Log():
 
     @staticmethod
     def format_message(record):
+        """
+        Formats the log message with the given record.
+
+        If an exception occurs while formatting the message, the exception is
+         included in the message.
+
+        Args:
+            record (logging.LogRecord): The log record to format.
+
+        Returns:
+            str: The formatted log message.
+        """
         # pylint: disable=broad-except
         try:
             msg = record.msg % record.args
@@ -79,11 +122,27 @@ class Log():
 
     @staticmethod
     def fatal(message, *args, **kwargs):
+        """
+        Logs a fatal error message and exits the program.
+
+        Args:
+            message (str): The error message to log.
+            *args: Positional arguments to format the error message.
+            **kwargs: Keyword arguments to format the error message.
+        """
         logging.fatal(message, *args, **kwargs)
         sys.exit(1)
 
     @staticmethod
     def setLevel(level):
+        """
+        Set the default logging level.
+
+        Args:
+            level: The new logging level.
+        Returns:
+            The old logging level.
+        """
         # We use setLevel instead of set_level because that's what logger
         # does. pylint: disable=invalid-name
         old_level = Log.logger.getEffectiveLevel()
@@ -189,7 +248,7 @@ class Ssh():
             start = time.time()  # Restart timeout because we have data
             if len(rlist) > 0:
                 try:
-                    buffer += channel.recv(4096).decode('utf-8')
+                    buffer += channel.recv(8192).decode('utf-8')
                 except socket.timeout:
                     time.sleep(.1)
             while '\n' in buffer or '\r' in buffer:
@@ -202,7 +261,7 @@ class Ssh():
                     break
                 yield line
         try:
-            buffer += channel.recv_stderr(4096).decode('utf-8')
+            buffer += channel.recv_stderr(8192).decode('utf-8')
         except socket.timeout:
             time.sleep(.1)
         if buffer != '':
@@ -239,6 +298,8 @@ class Ssh():
                     continue
                 result.append(line)
         exit_status = channel.recv_exit_status()
+        DEBUG(f'  {self.user}@{self.remote}: {command}')
+        DEBUG(f'  {result=}')
         DEBUG(f'  exit_status={exit_status}')
         return result, exit_status
 
@@ -264,11 +325,12 @@ class Secret():
                         self.pubkey = os.path.join(dirname, entry.name)
                     else:
                         self.privkey = os.path.join(dirname, entry.name)
-        DEBUG(f'located {self.privkey}')
+        DEBUG(f'located {self.privkey}: {self.remote=} {self.local=}')
 
     def _connect(self, use_privkey=False):
         if use_privkey:
             self._locate_key()
+            INFO(f'{self.remote=} {self.user=} {self.timeout=} {self.privkey=}')
             self.ssh = Ssh(self.remote, self.user, timeout=self.timeout,
                            privkey=self.privkey)
         else:
@@ -478,14 +540,12 @@ class Config():
             return values
         return None
 
-    def get_value(self, target, key, default=None):
+    def get_value(self, target, key):
         # Return value from section [target]
         value = self._get_value(target, key)
         if value:
             return value
-
-        # Maybe implement a [default] section in the future?
-        return default
+        return None
 
     def dump(self):
         output = ''
@@ -503,13 +563,14 @@ class Config():
 class Raid():
     # pylint: disable=invalid-name
     def __init__(self, name, remote, config, command, lvsvolume, devices,
-                 mqueue, timeout=5):
+                 raid_level, mqueue, timeout=5):
         self.name = name
         self.remote = remote
         self.config = config
         self.command = command
         self.lvsvolume = lvsvolume
         self.devices = devices
+        self.raid_level = raid_level
         self.mqueue = mqueue
         self.timeout = timeout
 
@@ -579,6 +640,7 @@ class Raid():
         self.uuid_devs = {}
         self.uuid_md = {}
         self.mds = set()
+        self.volumes = set()
         self.encrypted = set()
         self.partitions = {}
         self.drives = {}
@@ -682,8 +744,12 @@ class Raid():
                 if re.search(r'VG', line):
                     # Newer versions deactivate the VG on boot. Activate it
                     # here so that we can get VG status.
-                    _, vg = line.split()
-                    self.ssh.execute(f'vgchange -a y {vg}')
+                    try:
+                        _, vg = line.split()
+                        self.ssh.execute(f'vgchange -a y {vg}')
+                    except:
+                        # There isn't a VG.
+                        pass
 
             if volume not in self.sizes:
                 result, _ = self.ssh.execute(
@@ -710,13 +776,15 @@ class Raid():
         for i in range(0, 10):
             name = f'md{i}'
             if name not in self.mds:
+                self.mds.add(name)
                 return name
         self.FATAL('More than 10 md devices not supported')
 
     def _get_next_volname(self):
         for i in range(0, 10):
             name = f'r{i}'
-            if name not in self.mapping:
+            if name not in self.mapping and name not in self.volumes:
+                self.volumes.add(name)
                 return name
         self.FATAL('More than 10 volumes not supported')
 
@@ -747,6 +815,8 @@ class Raid():
             self.INFO(f'starting: {name} {uuid}')
             result, _ = self.ssh.execute(f'mdadm -A --uuid {uuid} {name}')
             self._dump(result)
+            result, _ = self.ssh.execute(f'mdadm --readwrite /dev/{name}')
+            self._dump(result)
 
     def _md5down(self):
         for uuid in self.uuid_devs:
@@ -754,21 +824,28 @@ class Raid():
             if name is None:
                 self.INFO(f'down: {uuid}')
                 continue
+
+            _, status = self.ssh.execute(f'test -f {uuid}.header')
+            if status:
+                self.INFO(f'NOT stopping: {name} {uuid} (no header)')
+                continue
+
             self.INFO(f'stopping: {name} {uuid}')
             dev = os.path.join("/dev/", name)
             result, _ = self.ssh.execute(f'mdadm -S {dev}')
             self._dump(result)
 
-    def _md5create(self, partitions, level=6):
+    def _md5create(self, partitions, raid_level):
         name = self._get_next_mdname()
         result, status = self.ssh.execute(
-            f'mdadm -C /dev/{name} --verbose -n {len(partitions)} -l {level}'
+            f'mdadm -C /dev/{name} --verbose'
+            f' -n {len(partitions)} -l {raid_level}'
             f' {" ".join(partitions)}',
             prompt='Continue creating array?',
             data='YES')
         self._dump(result)
         if status != 0:
-            self.FATAL('cannot create {name}')
+            self.FATAL(f'cannot create {name}')
 
         self.INFO('setting stripe_cache_size')
         result, status = self.ssh.execute(
@@ -783,7 +860,14 @@ class Raid():
             self.FATAL('cannot run /usr/share/mdadm/mkconf')
         for line in result:
             if line.startswith('ARRAY'):
-                _, _, meta, uuid, name = line.split()
+                result = line.split()
+                if len(result) == 5:
+                    # mdadm v4.1 and earlier
+                    _, _, meta, uuid, name = result
+                else:
+                    # mdadm v4.3 and later
+                    name=""
+                    _, _, meta, uuid = result
                 _, status = self.ssh.execute(
                     f'echo "ARRAY <ignore> {meta} {uuid} {name}"'
                     ' >> /etc/mdadm/mdadm.conf')
@@ -809,7 +893,11 @@ class Raid():
         self._dump(result)
 
     def _luksformat(self):
+        target_device = re.sub(r'/dev/', '', self.devices)
         for uuid, name in self.uuid_md.items():
+            if name != target_device:
+                self.INFO(f'skipping {name} {uuid} (target={target_device})')
+                continue
             luks_key = self._get_luks_key(uuid)
             if luks_key != '':
                 self.FATAL(f'LUKS key already exists for {name} {uuid}')
@@ -844,16 +932,22 @@ class Raid():
         if name not in self.provides:
             self.FATAL(f'cannot find volume for {name}')
         volume = self.provides[name]
-        result, _ = self.ssh.execute(f'pvcreate /dev/mapper/{volume}')
+        self.INFO(f'Found volume {volume} from {name}')
+        result, _ = self.ssh.execute(f'mdadm --readwrite /dev/{name}')
         self._dump(result)
+        self.INFO(f'/dev/{name} set to readwrite mode')
+        result, _ = self.ssh.execute(f'pvcreate -y /dev/mapper/{volume}')
+        self._dump(result)
+        self.INFO(f'/dev/mapper/{volume} created')
         result, _ = self.ssh.execute(f'pvs /dev/mapper/{volume} -o+pe_start')
         self._dump(result)
+        # This may fail because the --lvsvolume parameter didn't have a hyphen.
         vg, mountpoint = self.lvsvolume.split('-')
         result, _ = self.ssh.execute(
-            f'vgcreate -s 1g {vg} /dev/mapper/{volume}')
+            f'vgcreate -y -s 1g {vg} /dev/mapper/{volume}')
         self._dump(result)
         result, _ = self.ssh.execute(
-            f'lvcreate -l "100%FREE" -n {mountpoint} {vg}')
+            f'lvcreate -y -l "100%FREE" -n {mountpoint} {vg}')
         self._dump(result)
         self.INFO(f'lvs volume {self.lvsvolume} created on {vg}')
 
@@ -861,6 +955,11 @@ class Raid():
         # Bring up LUKS devices
         self._get_status()
         for uuid, name in self.uuid_md.items():
+            _, status = self.ssh.execute(f'test -f {uuid}.header')
+            if status:
+                self.INFO(f'NOT decrypting: {name} {uuid} (no header)')
+                continue
+
             if name in self.provides:
                 self.INFO(f'decrypted: {name} {uuid} as {self.provides[name]}')
                 continue
@@ -910,7 +1009,7 @@ class Raid():
                 if status == 0:
                     self.INFO(f'finished deactivating {path}')
                 else:
-                    self.FATAL(f'could not deactivating {path}')
+                    self.FATAL(f'could not deactivate {path}')
 
                 self.INFO(f'checking if {path} is activated')
                 result, status = self.ssh.execute(f'lvs --rows {path}')
@@ -933,9 +1032,15 @@ class Raid():
 
             # Do fsck
             self.INFO(f'checking {path}')
+            start_time = time.time()
             self.ssh.execute(f'e2fsck -f -y {path}', output=self.INFO,
                              timeout=600)
-            self.INFO(f'checked: {path}')
+            stop_time = time.time()
+            elapsed_seconds = stop_time - start_time
+            elapsed_minutes = elapsed_seconds // 60
+            elapsed_seconds -= elapsed_minutes * 60
+            self.INFO(f'checked: {path},'
+                      f' elapsed={elapsed_minutes}m {elapsed_seconds}s')
 
             # Mount
             _, lv = lvs.split('-', 1)
@@ -951,19 +1056,27 @@ class Raid():
 
     def _umount(self):
         for _, (mountpoint, _) in self.mounts.items():
+            if mountpoint == '/':
+                self.INFO(f'NOT umounting {mountpoint}')
             self.INFO(f'umounting {mountpoint}')
-            result, _ = self.ssh.execute(f'umount {mountpoint}')
+            result, status = self.ssh.execute(f'umount {mountpoint}')
             self._dump(result)
-            self.INFO(f'finished umounting {mountpoint}')
+            if status == 0:
+                self.INFO(f'finished umounting {mountpoint}')
+            else:
+                self.FATAL(f'could not umount {mountpoint}')
 
     def _services(self, start=False):
+        if start:
+            state = 'start'
+        else:
+            state = 'stop'
         for service in ['rpcbind', 'nfs-kernel-server', 'rsync']:
-            if start:
-                result, _ = self.ssh.execute(f'/etc/init.d/{service} start',
-                                             output=self.INFO, timeout=60)
-            else:
-                result, _ = self.ssh.execute(f'/etc/init.d/{service} stop')
+            result, status = self.ssh.execute(f'/etc/init.d/{service} {state}',
+                                              output=self.INFO, timeout=60)
             self._dump(result)
+            if status != 0:
+                self.INFO(f'could not {state} {service}, continuing')
 
     def _get_luks_key(self, uuid):
         # pylint: disable=broad-except
@@ -1012,6 +1125,10 @@ class Raid():
             return 7630880
         if tb == 12:
             return 11444216
+        if tb == 18:
+            return 17166328
+        if tb == 20:
+            return 19074040
 
         mb = int(size / 1024)
         mb = int(mb / 1024)
@@ -1121,21 +1238,34 @@ class Raid():
         self.status()
 
     def create(self):
+        self._get_status()
+        DEBUG('bringing services down')
         self._services(start=False)
+        DEBUG('bringing md devices up')
         self._md5up()
+        DEBUG('formatting LUKS device')
         uuid, name = self._luksformat()
+        if uuid is None or name is None:
+            self.INFO(f'format failed, exiting early')
+            DEBUG('bringing services up')
+            self._services(start=True)
+            return
+        DEBUG('opening LUKS devices')
         self._luksopen()
+        DEBUG('creating LVS')
         self._lvscreate(uuid, name)
+        DEBUG('taking everything down')
         self.down()
+        DEBUG('bringing everything up')
         self.up()
-        self.INFO(f'manually run mke2fs {self.lvsvolume}')
+        self.INFO(f'manually run mke2fs {self.lvsvolume} -- see https://busybox.net/~aldot/mkfs_stride.html')
 
     def partition(self):
         self.status()
         size = 0
         for dev in self.devices.split(','):
             if dev not in self.drives:
-                self.FATAL('{dev} does not exist')
+                self.FATAL(f'{dev} does not exist')
             if size == 0:
                 size = self.drives[dev]
             if size != self.drives[dev]:
@@ -1161,9 +1291,17 @@ class Raid():
             if size != self.partitions[part]:
                 self.FATAL(f'{part} has unexpected size: '
                            f'{self.partitions[part]} instead of {size}')
+
+        raid_level = self.raid_level
+        if self.raid_level is None or self.raid_level == -1:
+            if len(partitions) <= 5:
+                raid_level = 5
+            else:
+                raid_level = 6
+
         self.INFO(f'creating raid using {len(partitions)} partitions of size'
-                  f' {self._human(size,metric=True)}')
-        name = self._md5create(partitions)
+                  f' {self._human(size,metric=True)} at level {raid_level}')
+        name = self._md5create(partitions, raid_level)
         self.INFO(f'created {name} using {len(partitions)} partitions')
 
     def run(self):
@@ -1185,21 +1323,22 @@ class Raid():
 
 class Pool():
     def __init__(self, remote_list, config, command, lvsvolume=None,
-                 devices=None, max_workers=4, timeout=5):
+                 devices=None, raid_level=-1, max_workers=4, timeout=5):
         self.remote_list = remote_list
         self.config = config
         self.command = command
         self.lvsvolume = lvsvolume
         self.devices = devices
+        self.raid_level = raid_level
         self.max_workers = max_workers
         self.timeout = timeout
 
     @staticmethod
-    def _worker(name, remote, config, command, lvsvolume, devices, mqueue,
-                timeout=5):
+    def _worker(name, remote, config, command, lvsvolume, devices, raid_level,
+                mqueue, timeout=5):
         try:
             raid = Raid(name, remote, config, command, lvsvolume, devices,
-                        mqueue, timeout=timeout)
+                        raid_level, mqueue, timeout=timeout)
             raid.run()
         except Exception as exception:
             raise Exception(
@@ -1240,6 +1379,7 @@ class Pool():
                     self.command,
                     self.lvsvolume,
                     self.devices,
+                    self.raid_level,
                     mqueue)
                 jobs[name] = future
 
@@ -1294,7 +1434,7 @@ def main():
         MAKERAID: create an md raid from a set of partitions
         CREATE: generate keys and store them as specified in ~/.urraid,
                 format LUKS encrypted volume on an md raid,
-                create an LVS volume with the specified name
+                create an LVS volume with the specified name (e.g., v0-data)
 
         All UPPERCASE commands are DESTRUCTIVE and require:
           1) an interactive response from the console; and
@@ -1305,13 +1445,14 @@ def main():
                         help='command (status|up|down|'
                         'CREATE|PARTITION|MAKERAID)')
     parser.add_argument('--lvsvolume', type=str,
-                        help='name of LVS volume for CREATE, e.g., v0-data')
+                        help='name of LVS volume for CREATE,'
+                        ' including hyphen, e.g., v0-data')
     parser.add_argument('--devices', type=str,
-                        help='comma-separated list for PARTITION, MAKERAID,\n'
-                        'e.g., /dev/sdb,/dev/sdc or /dev/sdb1,/dev/sdc1')
-    parser.add_argument('--partitions', type=str,
-                        help='comma-separated list for MAKERAID,\n'
-                        'e.g., /dev/sdb1,/dev/sdc1')
+                        help='comma-separated list for PARTITION, MAKERAID,'
+                        ' CREATE, e.g., /dev/sdb,/dev/sdc or'
+                        ' /dev/sdb1,/dev/sdc1 or /dev/md2')
+    parser.add_argument('--level', type=str,
+                        help='RAID level for MAKERAID (5 if <= 5 disks; else 6)')
     parser.add_argument('--config', default=None,
                         help='configuration file')
     parser.add_argument('--dump', action='store_true', default=False,
@@ -1348,9 +1489,14 @@ def main():
         if len(target_list) > 1 or args.command or args.get or args.put:
             parser.print_help()
             sys.exit(1)
-        secret = Secret(target_list[0], socket.gethostname(),
-                        user=config.get_value(target_list[0], 'username',
-                                              'root'))
+
+        user=config.get_value(target_list[0], 'username')
+        if user is None:
+            user = 'root'
+        elif isinstance(user, list):
+            user = user[0]
+        secret = Secret(target_list[0], socket.gethostname(), user)
+
         secret.install()
         sys.exit(0)
 
@@ -1358,9 +1504,14 @@ def main():
         if len(target_list) > 1 or args.command or args.install or args.get:
             parser.print_help()
             sys.exit(1)
-        secret = Secret(target_list[0], socket.gethostname(),
-                        user=config.get_value(target_list[0], 'username',
-                                              'root'))
+
+        user=config.get_value(target_list[0], 'username')
+        if user is None:
+            user = 'root'
+        elif isinstance(user, list):
+            user = user[0]
+        secret = Secret(target_list[0], socket.gethostname(), user)
+
         secret.put_secret(*args.put)
         sys.exit(0)
 
@@ -1368,9 +1519,14 @@ def main():
         if len(target_list) > 1 or args.command or args.install or args.put:
             parser.print_help()
             sys.exit(1)
-        secret = Secret(target_list[0], socket.gethostname(),
-                        user=config.get_value(target_list[0], 'username',
-                                              'root'))
+
+        user=config.get_value(target_list[0], 'username')
+        if user is None:
+            user = 'root'
+        elif isinstance(user, list):
+            user = user[0]
+        secret = Secret(target_list[0], socket.gethostname(), user)
+
         INFO(f'secret: {secret.get_secret(args.get)}')
         sys.exit(0)
 
@@ -1380,10 +1536,17 @@ def main():
         sys.exit(1)
 
     if args.command == 'CREATE':
-        if not args.lvsvolume or len(target_list) > 1:
+        if not args.lvsvolume or len(target_list) != 1:
             parser.print_help()
             sys.exit(1)
-        result = confirm(f'Destroy data on {args.lvsvolume}: YES or no? ')
+        if not args.devices or re.search(r',', args.devices):
+            parser.print_help()
+            sys.exit(1)
+        if not re.search(r'-', args.lvsvolume):
+            parser.print_help()
+            sys.exit(1)
+        result = confirm(f'Destroy data on {args.devices} and'
+                         f' {args.lvsvolume}: YES or no? ')
         if not result:
             FATAL('No action taken -- must type "YES" to confirm')
 
@@ -1406,7 +1569,7 @@ def main():
             FATAL('No action taken -- must type "YES" to confirm')
 
     pool = Pool(target_list, config, args.command, lvsvolume=args.lvsvolume,
-                devices=args.devices)
+                devices=args.devices, raid_level=args.level)
     pool.run()
 
 
